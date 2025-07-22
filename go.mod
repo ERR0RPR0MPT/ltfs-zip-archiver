@@ -1,4 +1,4 @@
-module github.com/ERR0RPR0MPT/Tape/ltfs-zip-archiver
+module github.com/ERR0RPR0MPT/ltfs-zip-archiver
 
 go 1.22
 
