@@ -215,6 +215,9 @@ func main() {
 		if err != nil {
 			log.Fatalf("错误: 无法获取源 '%s' 的绝对路径: %v", source, err)
 		}
+		if !strings.HasSuffix(absSource, "\\") {
+			absSource += "\\"
+		}
 		if strings.HasPrefix(absDest, absSource) {
 			log.Fatalf("错误: 目标zip文件 '%s' 不能位于源目录 '%s' 中。", destFile, source)
 		}
@@ -236,7 +239,7 @@ func main() {
 			return nil
 		})
 		if err != nil {
-			log.Fatalf("错误: 扫描文件 '%s' 时出错: %v", source, err)
+			log.Printf("错误: 扫描文件 '%s' 时出错: %v", source, err)
 		}
 	}
 	log.Printf("扫描完成。共找到 %d 个文件, 总大小 %.2f MB\n", totalFiles, float64(totalSize)/1024/1024)
@@ -301,7 +304,12 @@ func main() {
 		ticker := time.NewTicker(200 * time.Millisecond) // 更新频率设为 200ms
 		defer ticker.Stop()
 
+		// 获取当前文件名并缩短
 		baseName := filepath.Base(destFile)
+		maxBaseNameLen := 16 // 路径最大显示长度
+		if len(baseName) > maxBaseNameLen {
+			baseName = "..." + baseName[len(baseName)-maxBaseNameLen+3:]
+		}
 		for {
 			select {
 			case <-ticker.C:
@@ -377,9 +385,10 @@ func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar, spee
 
 	copyBuffer := make([]byte, 5*1024*1024) // 5MB缓冲区
 
-	return filepath.Walk(basePath, func(path string, info os.FileInfo, err error) error {
+	_ = filepath.Walk(basePath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return err
+			log.Printf("发生错误: %v", err)
+			return nil
 		}
 
 		pauseController.WaitIfPaused()
@@ -391,13 +400,15 @@ func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar, spee
 
 		header, err := zip.FileInfoHeader(info)
 		if err != nil {
-			return err
+			log.Printf("发生错误: %v", err)
+			return nil
 		}
 
 		// 创建正确的相对路径
 		relPath, err := filepath.Rel(baseDir, path)
 		if err != nil {
-			return err
+			log.Printf("发生错误: %v", err)
+			return nil
 		}
 		// 如果源本身是文件，我们希望它在zip的根目录
 		if !info.IsDir() && baseDir == filepath.Dir(basePath) && basePath == path {
@@ -413,13 +424,15 @@ func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar, spee
 
 		writer, err := w.CreateHeader(header)
 		if err != nil {
-			return err
+			log.Printf("发生错误: %v", err)
+			return nil
 		}
 
 		if !info.IsDir() {
 			file, err := os.Open(path)
 			if err != nil {
-				return err
+				log.Printf("发生错误: %v", err)
+				return nil
 			}
 			defer file.Close()
 
@@ -429,7 +442,8 @@ func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar, spee
 				n, err := file.Read(copyBuffer)
 				if n > 0 {
 					if _, writeErr := writer.Write(copyBuffer[:n]); writeErr != nil {
-						return writeErr
+						log.Printf("发生错误: %v", err)
+						return nil
 					}
 
 					bar.Add(n)
@@ -439,10 +453,14 @@ func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar, spee
 					if err == io.EOF {
 						break
 					}
-					return err
+					log.Printf("发生错误: %v", err)
+					return nil
 				}
 			}
 		}
 		return nil
 	})
+
+	// 当发生错误时跳过错误
+	return nil
 }
