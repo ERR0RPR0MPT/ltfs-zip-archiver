@@ -26,3 +26,9 @@ LTFS ZIP Archiver 实现了按顺序写入 zip 档案压缩数据，适用于写
 
 使用终端打开 `ltfs-zip-archiver.exe` 即可，此时程序会读取数据并按照顺序写入磁带，
 终端会显示传输进度。
+
+## 编译
+
+```shell
+go build -o .\build\ltfs-zip-archiver.exe .
+```
