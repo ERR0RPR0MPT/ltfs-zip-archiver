@@ -215,9 +215,15 @@ func main() {
 		if err != nil {
 			log.Fatalf("错误: 无法获取源 '%s' 的绝对路径: %v", source, err)
 		}
-		if !strings.HasSuffix(absSource, "\\") {
-			absSource += "\\"
+
+		// Check if source is a directory and add a separator
+		info, err := os.Stat(absSource)
+		if err == nil && info.IsDir() {
+			if !strings.HasSuffix(absSource, string(os.PathSeparator)) {
+				absSource += string(os.PathSeparator)
+			}
 		}
+
 		if strings.HasPrefix(absDest, absSource) {
 			log.Fatalf("错误: 目标zip文件 '%s' 不能位于源目录 '%s' 中。", destFile, source)
 		}
@@ -291,7 +297,9 @@ func main() {
 	// 启动协程监听键盘输入
 	go func() {
 		// 确保在程序退出时能关闭标准输入，让 goroutine 结束
-		defer os.Stdin.Close()
+		defer func() {
+			_ = os.Stdin.Close()
+		}()
 		scanner := bufio.NewScanner(os.Stdin)
 		for scanner.Scan() {
 			pauseController.Toggle()
@@ -370,49 +378,35 @@ func main() {
 
 // addFiles 遍历路径并将其中的文件和目录添加到zip.Writer中
 func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar, speedTracker *SpeedTracker, pauseController *PauseController, currentFile *atomic.Value) error {
-	info, err := os.Stat(basePath)
-	if err != nil {
-		return err
-	}
-
-	var baseDir string
-	if info.IsDir() {
-		baseDir = basePath
-	} else {
-		// 如果 basePath 是一个文件，则其父目录是 baseDir
-		baseDir = filepath.Dir(basePath)
-	}
+	// *** FIX: baseDir should be the parent directory of the basePath. ***
+	// This ensures that the top-level directory/file from src.txt is included in the zip path.
+	baseDir := filepath.Dir(basePath)
 
 	copyBuffer := make([]byte, 5*1024*1024) // 5MB缓冲区
 
-	_ = filepath.Walk(basePath, func(path string, info os.FileInfo, err error) error {
+	return filepath.Walk(basePath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			log.Printf("发生错误: %v", err)
-			return nil
+			log.Printf("访问 %s 时发生错误: %v", path, err)
+			return nil // 继续处理其他文件
 		}
 
 		pauseController.WaitIfPaused()
 
 		// 更新当前正在处理的文件名，供进度条显示
-		// 使用相对路径以获得更简洁的显示
 		relPathForDisplay, _ := filepath.Rel(baseDir, path)
 		currentFile.Store(relPathForDisplay)
 
 		header, err := zip.FileInfoHeader(info)
 		if err != nil {
-			log.Printf("发生错误: %v", err)
-			return nil
+			log.Printf("无法获取文件头信息 %s: %v", path, err)
+			return nil // 继续处理其他文件
 		}
 
 		// 创建正确的相对路径
 		relPath, err := filepath.Rel(baseDir, path)
 		if err != nil {
-			log.Printf("发生错误: %v", err)
-			return nil
-		}
-		// 如果源本身是文件，我们希望它在zip的根目录
-		if !info.IsDir() && baseDir == filepath.Dir(basePath) && basePath == path {
-			relPath = filepath.Base(path)
+			log.Printf("无法创建相对路径 %s: %v", path, err)
+			return nil // 继续处理其他文件
 		}
 
 		header.Name = filepath.ToSlash(relPath)
@@ -424,43 +418,39 @@ func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar, spee
 
 		writer, err := w.CreateHeader(header)
 		if err != nil {
-			log.Printf("发生错误: %v", err)
-			return nil
+			log.Printf("无法在zip中创建文件头 %s: %v", header.Name, err)
+			return nil // 继续处理其他文件
 		}
 
 		if !info.IsDir() {
 			file, err := os.Open(path)
 			if err != nil {
-				log.Printf("发生错误: %v", err)
-				return nil
+				log.Printf("无法打开文件 %s: %v", path, err)
+				return nil // 继续处理其他文件
 			}
 			defer file.Close()
 
 			for {
 				pauseController.WaitIfPaused()
 
-				n, err := file.Read(copyBuffer)
+				n, readErr := file.Read(copyBuffer)
 				if n > 0 {
 					if _, writeErr := writer.Write(copyBuffer[:n]); writeErr != nil {
-						log.Printf("发生错误: %v", err)
-						return nil
+						log.Printf("写入zip文件时出错 %s: %v", path, writeErr)
+						return writeErr // 严重错误
 					}
-
 					bar.Add(n)
 					speedTracker.Update(int64(n))
 				}
-				if err != nil {
-					if err == io.EOF {
+				if readErr != nil {
+					if readErr == io.EOF {
 						break
 					}
-					log.Printf("发生错误: %v", err)
-					return nil
+					log.Printf("读取文件时出错 %s: %v", path, readErr)
+					return readErr // 严重错误
 				}
 			}
 		}
 		return nil
 	})
-
-	// 当发生错误时跳过错误
-	return nil
 }
