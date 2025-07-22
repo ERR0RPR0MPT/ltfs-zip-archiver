@@ -32,3 +32,7 @@ LTFS ZIP Archiver 实现了按顺序写入 zip 档案压缩数据，适用于写
 ```shell
 go build -o .\build\ltfs-zip-archiver.exe .
 ```
+
+## TODO
+
+- 从参数读取单切片的最大容量，并在分段压缩时提供确认
