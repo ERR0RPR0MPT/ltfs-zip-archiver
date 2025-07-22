@@ -3,6 +3,7 @@ package main
 import (
 	"archive/zip"
 	"bufio"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -180,7 +181,24 @@ func readLines(path string) ([]string, error) {
 	return lines, scanner.Err()
 }
 
+// PathMode 定义路径模式的类型
+type PathMode int
+
+const (
+	AbsolutePath PathMode = iota
+	RelativePath
+)
+
 func main() {
+	var useRelPath bool
+	flag.BoolVar(&useRelPath, "rel-path", false, "向zip文件写入相对路径 (shorthand: -r)")
+	flag.BoolVar(&useRelPath, "r", false, "向zip文件写入相对路径")
+	flag.Parse()
+
+	pathMode := AbsolutePath
+	if useRelPath {
+		pathMode = RelativePath
+	}
 	// 记录开始时间
 	startTime := time.Now()
 
@@ -358,9 +376,12 @@ func main() {
 		bufferedFile.Flush()
 	}()
 
+	// 用于跟踪已经创建的卷根目录
+	createdVolumes := make(map[string]bool)
+
 	// 遍历所有源，将它们添加到zip中
 	for _, source := range sources {
-		if err := addFiles(zipWriter, source, bar, speedTracker, pauseController, &currentFile); err != nil {
+		if err := addFiles(zipWriter, source, bar, speedTracker, pauseController, &currentFile, pathMode, createdVolumes); err != nil {
 			done <- true // 发生错误，通知更新 goroutine 停止
 			// 在新行打印错误，避免与进度条混淆
 			fmt.Fprintf(os.Stderr, "\n")
@@ -377,10 +398,19 @@ func main() {
 }
 
 // addFiles 遍历路径并将其中的文件和目录添加到zip.Writer中
-func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar, speedTracker *SpeedTracker, pauseController *PauseController, currentFile *atomic.Value) error {
-	// *** FIX: baseDir should be the parent directory of the basePath. ***
-	// This ensures that the top-level directory/file from src.txt is included in the zip path.
-	baseDir := filepath.Dir(basePath)
+func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar, speedTracker *SpeedTracker, pauseController *PauseController, currentFile *atomic.Value, pathMode PathMode, createdVolumes map[string]bool) error {
+	var baseDir string
+	if pathMode == RelativePath {
+		info, err := os.Stat(basePath)
+		if err != nil {
+			return fmt.Errorf("无法获取源信息 %s: %v", basePath, err)
+		}
+		if info.IsDir() {
+			baseDir = basePath
+		} else {
+			baseDir = filepath.Dir(basePath)
+		}
+	}
 
 	copyBuffer := make([]byte, 5*1024*1024) // 5MB缓冲区
 
@@ -393,8 +423,7 @@ func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar, spee
 		pauseController.WaitIfPaused()
 
 		// 更新当前正在处理的文件名，供进度条显示
-		relPathForDisplay, _ := filepath.Rel(baseDir, path)
-		currentFile.Store(relPathForDisplay)
+		currentFile.Store(filepath.Base(path))
 
 		header, err := zip.FileInfoHeader(info)
 		if err != nil {
@@ -402,14 +431,50 @@ func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar, spee
 			return nil // 继续处理其他文件
 		}
 
-		// 创建正确的相对路径
-		relPath, err := filepath.Rel(baseDir, path)
-		if err != nil {
-			log.Printf("无法创建相对路径 %s: %v", path, err)
-			return nil // 继续处理其他文件
+		var zipPath string
+		if pathMode == AbsolutePath {
+			absPath, err := filepath.Abs(path)
+			if err != nil {
+				log.Printf("无法获取绝对路径 %s: %v", path, err)
+				return nil
+			}
+			volumeName := filepath.VolumeName(absPath)         // e.g., "C:"
+			driveLetter := strings.TrimSuffix(volumeName, ":") // e.g., "C"
+
+			// 创建卷的根目录 (e.g., "C/")，仅创建一次
+			if driveLetter != "" && !createdVolumes[driveLetter] {
+				// 创建一个虚拟的 FileInfo 用于 FileInfoHeader
+				volHeader, _ := zip.FileInfoHeader(info)
+				volHeader.Name = driveLetter + "/"
+				volHeader.Method = zip.Store
+				if _, err := w.CreateHeader(volHeader); err != nil {
+					log.Printf("无法为卷创建目录 %s: %v", volHeader.Name, err)
+				}
+				createdVolumes[driveLetter] = true
+			}
+
+			// 从绝对路径中移除卷名和前导分隔符
+			pathWithoutVolume := strings.TrimPrefix(absPath, volumeName)
+			pathWithoutVolume = strings.TrimPrefix(pathWithoutVolume, string(os.PathSeparator))
+
+			// 将盘符和剩余路径结合起来
+			zipPath = filepath.Join(driveLetter, pathWithoutVolume)
+
+		} else { // RelativePath
+			relPath, err := filepath.Rel(baseDir, path)
+			if err != nil {
+				log.Printf("无法创建相对路径 %s (base: %s): %v", path, baseDir, err)
+				return nil
+			}
+			zipPath = relPath
 		}
 
-		header.Name = filepath.ToSlash(relPath)
+		// 如果zipPath为空（例如，当path和baseDir相同时），则跳过
+		if zipPath == "" || zipPath == "." {
+			return nil
+		}
+
+		header.Name = filepath.ToSlash(zipPath)
 		header.Method = zip.Store // 不压缩
 
 		if info.IsDir() {
@@ -419,14 +484,14 @@ func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar, spee
 		writer, err := w.CreateHeader(header)
 		if err != nil {
 			log.Printf("无法在zip中创建文件头 %s: %v", header.Name, err)
-			return nil // 继续处理其他文件
+			return nil
 		}
 
 		if !info.IsDir() {
 			file, err := os.Open(path)
 			if err != nil {
 				log.Printf("无法打开文件 %s: %v", path, err)
-				return nil // 继续处理其他文件
+				return nil
 			}
 			defer file.Close()
 
@@ -437,7 +502,7 @@ func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar, spee
 				if n > 0 {
 					if _, writeErr := writer.Write(copyBuffer[:n]); writeErr != nil {
 						log.Printf("写入zip文件时出错 %s: %v", path, writeErr)
-						return writeErr // 严重错误
+						return writeErr
 					}
 					bar.Add(n)
 					speedTracker.Update(int64(n))
@@ -447,7 +512,7 @@ func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar, spee
 						break
 					}
 					log.Printf("读取文件时出错 %s: %v", path, readErr)
-					return readErr // 严重错误
+					return readErr
 				}
 			}
 		}
