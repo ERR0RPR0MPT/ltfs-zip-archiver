@@ -254,7 +254,8 @@ func main() {
 	for _, source := range sources {
 		err := filepath.Walk(source, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
-				return err
+				log.Printf("访问 %s 时发生错误: %v", path, err)
+				return nil // 继续处理其他文件
 			}
 			if !info.IsDir() {
 				totalFiles++
@@ -502,7 +503,7 @@ func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar, spee
 				if n > 0 {
 					if _, writeErr := writer.Write(copyBuffer[:n]); writeErr != nil {
 						log.Printf("写入zip文件时出错 %s: %v", path, writeErr)
-						return writeErr
+						return nil
 					}
 					bar.Add(n)
 					speedTracker.Update(int64(n))
@@ -512,7 +513,7 @@ func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar, spee
 						break
 					}
 					log.Printf("读取文件时出错 %s: %v", path, readErr)
-					return readErr
+					return nil
 				}
 			}
 		}
