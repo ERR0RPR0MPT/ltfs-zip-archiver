@@ -1,0 +1,3 @@
+C:\example1
+D:\example2
+E:\example3
