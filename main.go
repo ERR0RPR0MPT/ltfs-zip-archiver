@@ -277,24 +277,11 @@ func readLines(path string) ([]string, error) {
 	return lines, scanner.Err()
 }
 
-// PathMode 定义路径模式的类型
-type PathMode int
-
-const (
-	AbsolutePath PathMode = iota
-	RelativePath
-)
-
 func main() {
-	var useRelPath bool
-	flag.BoolVar(&useRelPath, "rel-path", false, "向zip文件写入相对路径 (shorthand: -r)")
-	flag.BoolVar(&useRelPath, "r", false, "向zip文件写入相对路径")
+	var noSha256 bool
+	flag.BoolVar(&noSha256, "n", false, "跳过SHA256计算")
 	flag.Parse()
 
-	pathMode := AbsolutePath
-	if useRelPath {
-		pathMode = RelativePath
-	}
 	// 记录开始时间
 	startTime := time.Now()
 
@@ -463,11 +450,19 @@ func main() {
 		}
 	}()
 
-	// 创建异步SHA256计算写入器
-	sha256Writer := NewAsyncSHA256Writer(file)
+	// 根据是否需要计算SHA256选择写入器
+	var finalWriter io.Writer
+	var sha256Writer *AsyncSHA256Writer
+
+	if noSha256 {
+		finalWriter = file
+	} else {
+		sha256Writer = NewAsyncSHA256Writer(file)
+		finalWriter = sha256Writer
+	}
 
 	// 创建带缓冲的文件写入器
-	bufferedFile := NewBufferedWriter(sha256Writer, 10*1024*1024) // 10MB buffer
+	bufferedFile := NewBufferedWriter(finalWriter, 10*1024*1024) // 10MB buffer
 
 	// 创建 Zip Writer
 	zipWriter := zip.NewWriter(bufferedFile)
@@ -481,7 +476,7 @@ func main() {
 
 	// 遍历所有源，将它们添加到zip中
 	for _, source := range sources {
-		if err := addFiles(zipWriter, source, bar, speedTracker, pauseController, &currentFile, pathMode, createdVolumes); err != nil {
+		if err := addFiles(zipWriter, source, bar, speedTracker, pauseController, &currentFile, createdVolumes); err != nil {
 			done <- true // 发生错误，通知更新 goroutine 停止
 			// 在新行打印错误，避免与进度条混淆
 			fmt.Fprintf(os.Stderr, "\n")
@@ -494,7 +489,10 @@ func main() {
 	bufferedFile.Flush()
 
 	// 获取计算出的SHA256值
-	sha256Sum := sha256Writer.Sum()
+	var sha256Sum string
+	if !noSha256 && sha256Writer != nil {
+		sha256Sum = sha256Writer.Sum()
+	}
 
 	done <- true // 通知进度条更新 goroutine 退出
 	bar.Finish() // 确保进度条达到100%
@@ -503,35 +501,27 @@ func main() {
 	duration := time.Since(startTime)
 	log.Printf("压缩完成。总共用时: %.2f 秒", duration.Seconds())
 
-	if sha256Sum != "" {
-		log.Printf("SHA256 校验和: %s", sha256Sum)
+	if !noSha256 {
+		if sha256Sum != "" {
+			log.Printf("SHA256 校验和: %s", sha256Sum)
 
-		// 将SHA256写入到同名的.sha256文件中
-		sha256File := destFile + ".sha256"
-		if err := os.WriteFile(sha256File, []byte(sha256Sum+"  "+filepath.Base(destFile)+"\n"), 0644); err != nil {
-			log.Printf("警告: 无法写入SHA256文件 %s: %v", sha256File, err)
+			// 将SHA256写入到同名的.sha256文件中
+			sha256File := destFile + ".sha256"
+			if err := os.WriteFile(sha256File, []byte(sha256Sum+"  "+filepath.Base(destFile)+"\n"), 0644); err != nil {
+				log.Printf("警告: 无法写入SHA256文件 %s: %v", sha256File, err)
+			} else {
+				log.Printf("SHA256校验和已保存到: %s", sha256File)
+			}
 		} else {
-			log.Printf("SHA256校验和已保存到: %s", sha256File)
+			log.Printf("警告: SHA256计算超时或失败")
 		}
-	} else {
-		log.Printf("警告: SHA256计算超时或失败")
 	}
 }
 
 // addFiles 遍历路径并将其中的文件和目录添加到zip.Writer中
-func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar, speedTracker *SpeedTracker, pauseController *PauseController, currentFile *atomic.Value, pathMode PathMode, createdVolumes map[string]bool) error {
-	var baseDir string
-	if pathMode == RelativePath {
-		info, err := os.Stat(basePath)
-		if err != nil {
-			return fmt.Errorf("无法获取源信息 %s: %v", basePath, err)
-		}
-		if info.IsDir() {
-			baseDir = basePath
-		} else {
-			baseDir = filepath.Dir(basePath)
-		}
-	}
+func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar,
+	speedTracker *SpeedTracker, pauseController *PauseController, currentFile *atomic.Value,
+	createdVolumes map[string]bool) error {
 
 	copyBuffer := make([]byte, 5*1024*1024) // 5MB缓冲区
 
@@ -552,43 +542,32 @@ func addFiles(w *zip.Writer, basePath string, bar *progressbar.ProgressBar, spee
 			return nil // 继续处理其他文件
 		}
 
-		var zipPath string
-		if pathMode == AbsolutePath {
-			absPath, err := filepath.Abs(path)
-			if err != nil {
-				log.Printf("无法获取绝对路径 %s: %v", path, err)
-				return nil
-			}
-			volumeName := filepath.VolumeName(absPath)         // e.g., "C:"
-			driveLetter := strings.TrimSuffix(volumeName, ":") // e.g., "C"
-
-			// 创建卷的根目录 (e.g., "C/")，仅创建一次
-			if driveLetter != "" && !createdVolumes[driveLetter] {
-				// 创建一个虚拟的 FileInfo 用于 FileInfoHeader
-				volHeader, _ := zip.FileInfoHeader(info)
-				volHeader.Name = driveLetter + "/"
-				volHeader.Method = zip.Store
-				if _, err := w.CreateHeader(volHeader); err != nil {
-					log.Printf("无法为卷创建目录 %s: %v", volHeader.Name, err)
-				}
-				createdVolumes[driveLetter] = true
-			}
-
-			// 从绝对路径中移除卷名和前导分隔符
-			pathWithoutVolume := strings.TrimPrefix(absPath, volumeName)
-			pathWithoutVolume = strings.TrimPrefix(pathWithoutVolume, string(os.PathSeparator))
-
-			// 将盘符和剩余路径结合起来
-			zipPath = filepath.Join(driveLetter, pathWithoutVolume)
-
-		} else { // RelativePath
-			relPath, err := filepath.Rel(baseDir, path)
-			if err != nil {
-				log.Printf("无法创建相对路径 %s (base: %s): %v", path, baseDir, err)
-				return nil
-			}
-			zipPath = relPath
+		absPath, err := filepath.Abs(path)
+		if err != nil {
+			log.Printf("无法获取绝对路径 %s: %v", path, err)
+			return nil
 		}
+		volumeName := filepath.VolumeName(absPath)         // e.g., "C:"
+		driveLetter := strings.TrimSuffix(volumeName, ":") // e.g., "C"
+
+		// 创建卷的根目录 (e.g., "C/")，仅创建一次
+		if driveLetter != "" && !createdVolumes[driveLetter] {
+			// 创建一个虚拟的 FileInfo 用于 FileInfoHeader
+			volHeader, _ := zip.FileInfoHeader(info)
+			volHeader.Name = driveLetter + "/"
+			volHeader.Method = zip.Store
+			if _, err := w.CreateHeader(volHeader); err != nil {
+				log.Printf("无法为卷创建目录 %s: %v", volHeader.Name, err)
+			}
+			createdVolumes[driveLetter] = true
+		}
+
+		// 从绝对路径中移除卷名和前导分隔符
+		pathWithoutVolume := strings.TrimPrefix(absPath, volumeName)
+		pathWithoutVolume = strings.TrimPrefix(pathWithoutVolume, string(os.PathSeparator))
+
+		// 将盘符和剩余路径结合起来
+		zipPath := filepath.Join(driveLetter, pathWithoutVolume)
 
 		// 如果zipPath为空（例如，当path和baseDir相同时），则跳过
 		if zipPath == "" || zipPath == "." {
