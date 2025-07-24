@@ -3,8 +3,11 @@ package main
 import (
 	"archive/zip"
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"flag"
 	"fmt"
+	"hash"
 	"io"
 	"log"
 	"os"
@@ -159,6 +162,99 @@ func (bw *BufferedWriter) Flush() error {
 	_, err := bw.writer.Write(bw.buffer[:bw.offset])
 	bw.offset = 0
 	return err
+}
+
+// AsyncSHA256Writer 在单独的goroutine中异步计算SHA256哈希值
+type AsyncSHA256Writer struct {
+	writer   io.Writer
+	hasher   hash.Hash
+	dataCh   chan []byte
+	doneCh   chan struct{}
+	resultCh chan string
+	wg       sync.WaitGroup
+	mu       sync.Mutex
+	closed   bool
+}
+
+func NewAsyncSHA256Writer(writer io.Writer) *AsyncSHA256Writer {
+	asw := &AsyncSHA256Writer{
+		writer:   writer,
+		hasher:   sha256.New(),
+		dataCh:   make(chan []byte, 10), // 缓冲通道提高性能
+		doneCh:   make(chan struct{}),
+		resultCh: make(chan string, 1),
+	}
+
+	// 启动哈希计算goroutine
+	asw.wg.Add(1)
+	go asw.hashWorker()
+
+	return asw
+}
+
+func (asw *AsyncSHA256Writer) hashWorker() {
+	defer asw.wg.Done()
+
+	for {
+		select {
+		case data := <-asw.dataCh:
+			if data == nil {
+				// 收到结束信号
+				asw.resultCh <- hex.EncodeToString(asw.hasher.Sum(nil))
+				return
+			}
+			asw.hasher.Write(data)
+		case <-asw.doneCh:
+			// 强制结束
+			return
+		}
+	}
+}
+
+func (asw *AsyncSHA256Writer) Write(p []byte) (n int, err error) {
+	// 先写入到目标writer
+	n, err = asw.writer.Write(p)
+	if err != nil {
+		return n, err
+	}
+
+	// 异步发送数据给哈希计算器
+	asw.mu.Lock()
+	if !asw.closed && n > 0 {
+		// 创建数据副本以避免竞态条件
+		dataCopy := make([]byte, n)
+		copy(dataCopy, p[:n])
+
+		// 阻塞等待直到数据被发送到通道
+		asw.dataCh <- dataCopy
+	}
+	asw.mu.Unlock()
+
+	return n, nil
+}
+
+func (asw *AsyncSHA256Writer) Close() {
+	asw.mu.Lock()
+	if !asw.closed {
+		asw.closed = true
+		// 发送结束信号
+		asw.dataCh <- nil
+	}
+	asw.mu.Unlock()
+}
+
+func (asw *AsyncSHA256Writer) Sum() string {
+	asw.Close()
+
+	// 等待哈希计算完成
+	select {
+	case result := <-asw.resultCh:
+		return result
+	case <-time.After(30 * time.Second): // 超时保护
+		close(asw.doneCh)
+		asw.wg.Wait()
+		return ""
+	}
 }
 
 // readLines 从指定文件中读取所有行，并去除每行首尾的引号和空白
@@ -367,8 +463,11 @@ func main() {
 		}
 	}()
 
+	// 创建异步SHA256计算写入器
+	sha256Writer := NewAsyncSHA256Writer(file)
+
 	// 创建带缓冲的文件写入器
-	bufferedFile := NewBufferedWriter(file, 10*1024*1024) // 10MB buffer
+	bufferedFile := NewBufferedWriter(sha256Writer, 10*1024*1024) // 10MB buffer
 
 	// 创建 Zip Writer
 	zipWriter := zip.NewWriter(bufferedFile)
@@ -390,12 +489,33 @@ func main() {
 		}
 	}
 
+	// 确保所有数据都被刷新到文件
+	zipWriter.Close()
+	bufferedFile.Flush()
+
+	// 获取计算出的SHA256值
+	sha256Sum := sha256Writer.Sum()
+
 	done <- true // 通知进度条更新 goroutine 退出
 	bar.Finish() // 确保进度条达到100%
 
 	// 计算并打印总耗时
 	duration := time.Since(startTime)
 	log.Printf("压缩完成。总共用时: %.2f 秒", duration.Seconds())
+
+	if sha256Sum != "" {
+		log.Printf("SHA256 校验和: %s", sha256Sum)
+
+		// 将SHA256写入到同名的.sha256文件中
+		sha256File := destFile + ".sha256"
+		if err := os.WriteFile(sha256File, []byte(sha256Sum+"  "+filepath.Base(destFile)+"\n"), 0644); err != nil {
+			log.Printf("警告: 无法写入SHA256文件 %s: %v", sha256File, err)
+		} else {
+			log.Printf("SHA256校验和已保存到: %s", sha256File)
+		}
+	} else {
+		log.Printf("警告: SHA256计算超时或失败")
+	}
 }
 
 // addFiles 遍历路径并将其中的文件和目录添加到zip.Writer中
